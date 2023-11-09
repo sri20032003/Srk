@@ -1,0 +1,296 @@
+const express = require('express');
+const bodyParser = require('body-parser');
+const mongoose = require('mongoose');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
+const session = require('express-session');
+const MongoStore = require('connect-mongo')(session);
+
+const app = express();
+const port = 3000;
+
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
+
+// Replace 'your_mongodb_url' with your MongoDB connection URL
+mongoose.connect('your_mongodb_url', { useNewUrlParser: true, useUnifiedTopology: true });
+
+// User model
+const User = mongoose.model('User', {
+  name: String,
+  email: String,
+  password: String,
+  role: String,
+  verified: Boolean,
+  verificationToken: String,
+  resetPasswordToken: String,
+  resetPasswordExpires: Date,
+});
+
+// Define user roles
+const USER_ROLES = {
+  USER: 'user',
+  ADMIN: 'admin',
+};
+
+// Create a transporter for sending verification and reset emails
+const transporter = nodemailer.createTransport({
+  service: 'Gmail', // Use your email service provider
+  auth: {
+    user: 'your_email@gmail.com', // Your email
+    pass: 'your_email_password', // Your email password
+  },
+});
+
+// Generate a random verification token
+function generateVerificationToken() {
+  return Math.random().toString(36).substring(2, 15);
+}
+
+// Middleware to verify JWT and authenticate users
+function authenticateToken(req, res, next) {
+  const token = req.header('Authorization');
+
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  jwt.verify(token, 'your_secret_key', (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Token is not valid' });
+    }
+    req.user = user;
+    next();
+  });
+}
+
+// Set up session-based authentication
+app.use(
+  session({
+    secret: 'your_session_secret', // Replace with your session secret
+    resave: false,
+    saveUninitialized: true,
+    store: new MongoStore({ mongooseConnection: mongoose.connection }),
+  })
+);
+
+// Registration route
+app.post('/register', async (req, res) => {
+  const { name, email, password, role } = req.body;
+
+  // Validate user input
+  if (!name || !email || !password || !role) {
+    return res.status(400).json({ error: 'All fields are required' });
+  }
+
+  // Check if the role is valid
+  if (!Object.values(USER_ROLES).includes(role)) {
+    return res.status(400).json({ error: 'Invalid user role' });
+  }
+
+  try {
+    // Check if the user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email is already registered' });
+    }
+
+    // Hash the user's password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const user = new User({ name, email, password: hashedPassword, role });
+
+    // Generate a verification token and set it to the user
+    user.verificationToken = generateVerificationToken();
+
+    await user.save();
+
+    // Send an email with a verification link
+    const mailOptions = {
+      from: 'your_email@gmail.com',
+      to: email,
+      subject: 'Email Verification',
+      text: `Click this link to verify your email: http://yourapp.com/verify/${user.verificationToken}`,
+    };
+
+    transporter.sendMail(mailOptions, (error, info) => {
+      if (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Email verification failed' });
+      } else {
+        res.json({ message: 'User registered successfully. Please check your email to verify your account.' });
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// Login route
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // Create a user session
+    req.session.userId = user._id;
+
+    res.json({ message: 'Login successful' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Logout route
+app.post('/logout', (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      console.error(err);
+      return res.status(500).json({ error: 'Logout failed' });
+    }
+    res.json({ message: 'Logout successful' });
+  });
+});
+
+// Email verification route
+app.get('/verify/:token', async (req, res) => {
+  const token = req.params.token;
+
+  try {
+    const user = await User.findOne({ verificationToken: token });
+
+    if (!user) {
+      return res.status(404).json({ error: 'Invalid verification token' });
+    }
+
+    // Mark the user as verified and clear the verification token
+    user.verified = true;
+    user.verificationToken = null;
+
+    await user.save();
+
+    res.json({ message: 'Email verification successful' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Email verification failed' });
+  }
+});
+
+// Password reset route
+app.post('/reset-password', async (req, res) => {
+  const { email } = req.body;
+
+  // Validate user input
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+
+  try {
+    // Check if the user exists
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Generate a password reset token and set it to the user
+    user.resetPasswordToken = generateVerificationToken();
+    user.resetPasswordExpires = Date.now() + 3600000; // Token expiration time (1 hour)
+
+    await user.save();
+
+    // Send an email with a password reset link
+    const resetMailOptions = {
+      from: 'your_email@gmail.com',
+      to: email,
+      subject: 'Password Reset',
+      text: `Click this link to reset your password: http://yourapp.com/reset-password/${user.resetPasswordToken}`,
+    };
+
+    transporter.sendMail(resetMailOptions, (error, info) => {
+      if (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Password reset request failed' });
+      } else {
+        res.json({ message: '        res.json({ message: 'Password reset email sent. Please check your email to reset your password.' });
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Password reset request failed' });
+  }
+});
+
+// Update user profile route
+app.put('/profile', authenticateToken, async (req, res) => {
+  const { name, email, password } = req.body;
+  const userId = req.user.userId;
+
+  try {
+    const user = await User.findById(userId);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Update user's profile fields
+    if (name) user.name = name;
+    if (email) user.email = email;
+    if (password) {
+      // Hash the new password
+      user.password = await bcrypt.hash(password, 10);
+    }
+
+    await user.save();
+
+    res.json({ message: 'Profile updated successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Profile update failed' });
+  }
+});
+
+// Get user profile route
+app.get('/profile', authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+
+  try {
+    const user = await User.findById(userId);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json(user);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error fetching user profile' });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Something went wrong' });
+});
+
+// ... Continue with other routes and server setup
+
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});
+
